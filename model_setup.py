@@ -52,7 +52,8 @@ def setup_model_and_tokenizer(config):
         )
         
         model = get_peft_model(model, lora_config)
-        print(f"LoRA adapters added to model. Trainable parameters: {model.num_parameters()}")
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"LoRA adapters added to model. Trainable parameters: {trainable_params:,}")
     
     # Enable gradient checkpointing for memory efficiency
     model.gradient_checkpointing_enable()
@@ -75,7 +76,7 @@ def setup_optimizer(model, config, stage: str):
             trainable_params,
             lr=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
-            betas=config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"],
+            betas=(config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"]),
             eps=config.optimizer.adamw["eps"]
         )
         
@@ -87,7 +88,7 @@ def setup_optimizer(model, config, stage: str):
                 trainable_params,
                 lr=training_config.learning_rate,
                 weight_decay=training_config.weight_decay,
-                betas=config.optimizer.muon["beta1"], config.optimizer.muon["beta2"],
+                betas=(config.optimizer.muon["beta1"], config.optimizer.muon["beta2"]),
                 eps=config.optimizer.muon["eps"],
                 mu=config.optimizer.muon["mu"]
             )
@@ -97,7 +98,7 @@ def setup_optimizer(model, config, stage: str):
                 trainable_params,
                 lr=training_config.learning_rate,
                 weight_decay=training_config.weight_decay,
-                betas=config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"],
+                betas=(config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"]),
                 eps=config.optimizer.adamw["eps"]
             )
     
@@ -132,14 +133,16 @@ def save_model_checkpoint(model, optimizer, scheduler, epoch, step, config, stag
         model.save_pretrained(save_dir)
     
     # Save optimizer and scheduler state
-    torch.save({
+    training_state = {
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'epoch': epoch,
         'step': step
-    }, os.path.join(save_dir, 'training_state.pt'))
-    
+    }
+    torch.save(training_state, os.path.join(save_dir, 'training_state.pt'))
+
     print(f"Checkpoint saved to {save_dir}")
+
 
 def load_model_checkpoint(model, optimizer, scheduler, checkpoint_path: str):
     """Load model checkpoint."""
@@ -151,12 +154,13 @@ def load_model_checkpoint(model, optimizer, scheduler, checkpoint_path: str):
     else:
         # Full model
         model.load_state_dict(torch.load(os.path.join(checkpoint_path, 'pytorch_model.bin')))
-    
+
     # Load training state
     training_state = torch.load(os.path.join(checkpoint_path, 'training_state.pt'))
     optimizer.load_state_dict(training_state['optimizer_state_dict'])
-    scheduler.load_state_dict(training_state['scheduler_state_dict'])
-    
+    if scheduler is not None and training_state.get('scheduler_state_dict') is not None:
+        scheduler.load_state_dict(training_state['scheduler_state_dict'])
+
     return model, optimizer, scheduler, training_state['epoch'], training_state['step']
 
 def get_model_size_info(model):

@@ -1,0 +1,46 @@
+# Python cache and build files
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# IDE/editor files
+.idea/
+.vscode/
+.DS_Store
+
+# Test/cache
+.pytest_cache/
+.mypy_cache/
+
+# Project outputs
+logs/
+tensorboard_logs/
+checkpoints/
+example_logs/
+example_tensorboard/
+example_checkpoints/
+comparison_logs/
+comparison_tensorboard/
+comparison_checkpoints/
+demo_logs/
+demo_tensorboard/
+demo_checkpoints/
+custom_logs/
+custom_tensorboard/
+custom_checkpoints/
+
+# Model artifacts
+*.pt
+*.bin
+
+# Local config overrides
+custom_config.yaml

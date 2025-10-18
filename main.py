@@ -116,7 +116,7 @@ def setup_experiment(config, args):
     
     return config
 
-def run_single_experiment(config, args):
+def run_single_experiment(config, args=None):
     """Run a single experiment with the given configuration."""
     print("\nInitializing model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(config)
@@ -124,7 +124,7 @@ def run_single_experiment(config, args):
     # Print model info
     get_model_size_info(model)
     
-    if args.skip_training:
+    if args and getattr(args, 'skip_training', False):
         print("Skipping training as requested...")
     else:
         # Run simplified two-stage training
@@ -153,7 +153,8 @@ def run_comparison_experiment(config, args):
     
     # Run with AdamW
     print("\nRunning experiment with AdamW optimizer...")
-    config_adamw = config
+    import copy
+    config_adamw = copy.deepcopy(config)
     config_adamw.optimizer.type = "adamw"
     config_adamw.logging.log_dir = os.path.join(config.logging.log_dir, "adamw")
     config_adamw.logging.tensorboard_dir = os.path.join(config.logging.tensorboard_dir, "adamw")
@@ -164,7 +165,7 @@ def run_comparison_experiment(config, args):
     
     # Run with Muon
     print("\nRunning experiment with Muon optimizer...")
-    config_muon = config
+    config_muon = copy.deepcopy(config)
     config_muon.optimizer.type = "muon"
     config_muon.logging.log_dir = os.path.join(config.logging.log_dir, "muon")
     config_muon.logging.tensorboard_dir = os.path.join(config.logging.tensorboard_dir, "muon")
