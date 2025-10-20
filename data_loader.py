@@ -43,7 +43,7 @@ class GSM8KDataset(Dataset):
             prompt,
             truncation=True,
             max_length=self.max_length,
-            padding='max_length',
+            padding=False,
             return_tensors='pt'
         )
         prompt_length = prompt_encoding['input_ids'].shape[1]
@@ -100,7 +100,7 @@ class AQUARATDataset(Dataset):
             prompt,
             truncation=True,
             max_length=self.max_length,
-            padding='max_length',
+            padding=False,
             return_tensors='pt'
         )
         prompt_length = prompt_encoding['input_ids'].shape[1]

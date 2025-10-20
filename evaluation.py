@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import re
 import json
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 

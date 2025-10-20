@@ -26,7 +26,9 @@ def compare_stage_samples(stage1_records: List[Dict], stage2_records: List[Dict]
     """Compare sample records between stages."""
     comparison = {
         'stage1_analysis': analyze_replay_samples(stage1_records),
-        'stage2_analysis': analyze_replay_samples(stage2_records)
+        'stage2_analysis': analyze_replay_samples(stage2_records),
+        'stage1_records': stage1_records,
+        'stage2_records': stage2_records,
     }
     
     # Calculate forgetting metrics
@@ -60,8 +62,8 @@ def visualize_replay_analysis(comparison: Dict[str, Any], save_path: str):
     axes[0, 0].set_ylim(0, 1)
     
     # Prompt length distribution
-    stage1_prompt_lengths = [s['prompt_length'] for s in comparison['stage1_analysis']['sample_records']]
-    stage2_prompt_lengths = [s['prompt_length'] for s in comparison['stage2_analysis']['sample_records']]
+    stage1_prompt_lengths = [s['prompt_length'] for s in comparison.get('stage1_records', [])]
+    stage2_prompt_lengths = [s['prompt_length'] for s in comparison.get('stage2_records', [])]
     
     axes[0, 1].hist([stage1_prompt_lengths, stage2_prompt_lengths], 
                    bins=20, alpha=0.7, label=['Stage 1', 'Stage 2'])
@@ -71,8 +73,8 @@ def visualize_replay_analysis(comparison: Dict[str, Any], save_path: str):
     axes[0, 1].legend()
     
     # Generation length distribution
-    stage1_gen_lengths = [s['generation_length'] for s in comparison['stage1_analysis']['sample_records']]
-    stage2_gen_lengths = [s['generation_length'] for s in comparison['stage2_analysis']['sample_records']]
+    stage1_gen_lengths = [s['generation_length'] for s in comparison.get('stage1_records', [])]
+    stage2_gen_lengths = [s['generation_length'] for s in comparison.get('stage2_records', [])]
     
     axes[1, 0].hist([stage1_gen_lengths, stage2_gen_lengths], 
                    bins=20, alpha=0.7, label=['Stage 1', 'Stage 2'])
