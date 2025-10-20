@@ -25,7 +25,7 @@ from config import load_config, save_config
 from model_setup import setup_model_and_tokenizer, get_model_size_info
 from training import Trainer, run_two_stage_training
 from evaluation import evaluate_catastrophic_forgetting, save_evaluation_results, print_evaluation_summary, compare_optimizer_results
-from logging import Logger
+from my_logging import Logger
 
 def parse_args():
     """Parse command line arguments."""

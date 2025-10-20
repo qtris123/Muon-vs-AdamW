@@ -75,7 +75,7 @@ def setup_optimizer(model, config, stage: str):
             trainable_params,
             lr=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
-            betas=config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"],
+            betas=(config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"]),
             eps=config.optimizer.adamw["eps"]
         )
         
@@ -87,7 +87,7 @@ def setup_optimizer(model, config, stage: str):
                 trainable_params,
                 lr=training_config.learning_rate,
                 weight_decay=training_config.weight_decay,
-                betas=config.optimizer.muon["beta1"], config.optimizer.muon["beta2"],
+                betas=(config.optimizer.muon["beta1"], config.optimizer.muon["beta2"]),
                 eps=config.optimizer.muon["eps"],
                 mu=config.optimizer.muon["mu"]
             )
@@ -97,7 +97,7 @@ def setup_optimizer(model, config, stage: str):
                 trainable_params,
                 lr=training_config.learning_rate,
                 weight_decay=training_config.weight_decay,
-                betas=config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"],
+                betas=(config.optimizer.adamw["beta1"], config.optimizer.adamw["beta2"]),
                 eps=config.optimizer.adamw["eps"]
             )
     
