@@ -1,0 +1,12 @@
+# Ignore training output and logs
+checkpoints/
+mock/
+performace_keeper/
+run_logs/
+tensorboard/
+
+# Ignore notebooks and temporary files
+training_with_tinker.py
+*.ipynb
+requirements.txt
+
