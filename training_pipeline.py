@@ -29,9 +29,10 @@ class StopOnTokens(StoppingCriteria):
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs):
         # if the last token generated matches any of the stop ids, halt generation
-        if input_ids[0, -1].item() in self.stop_ids:
-            return True
-        return False
+        last_tokens = input_ids[:, -1]
+        stopped_mask = torch.isin(last_tokens, torch.tensor(list(self.stop_ids), device=last_tokens.device))
+        all_done = stopped_mask.all().item()
+        return bool(all_done)
 class ThroughputCallback(TrainerCallback):
     def __init__(self, tokenizer, eval_dataset, temperature, max_new_tokens = 200, top_p = 1.0):
         self.eval_dataset = eval_dataset
