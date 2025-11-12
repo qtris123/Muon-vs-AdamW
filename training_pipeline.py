@@ -24,13 +24,13 @@ from transformers import TrainerCallback
 import time, torch, wandb
 
 class StopOnTokens(StoppingCriteria):
-    def __init__(self, stop_ids: list[int]):
-        self.stop_ids = stop_ids
+    def __init__(self, stop_ids: list[int], device = "cuda"):
+        self.stop_ids = torch.tensor(stop_ids, device=device)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs):
         # if the last token generated matches any of the stop ids, halt generation
         last_tokens = input_ids[:, -1]
-        stopped_mask = torch.isin(last_tokens, torch.tensor(list(self.stop_ids), device=last_tokens.device))
+        stopped_mask = torch.isin(last_tokens, self.stop_ids)
         all_done = stopped_mask.all().item()
         return bool(all_done)
 class ThroughputCallback(TrainerCallback):
@@ -52,8 +52,15 @@ class ThroughputCallback(TrainerCallback):
             target_text = tokenizer.decode([t for t in labels if t != -100], skip_special_tokens=True)
             gold_ans = self.extract_number(target_text)
             self.answers.append(gold_ans)
-        stop_tokens = self.tokenizer.convert_tokens_to_ids(["Question:", self.tokenizer.eos_token])
-        self.stopping_criteria = StoppingCriteriaList([StopOnTokens(stop_tokens)])
+        # Prepare stop tokens
+        stop_words = ["Question"]
+        stop_ids = set()
+        for stop_word in stop_words:
+            word_ids = tokenizer.encode(stop_word, add_special_tokens=False)
+            stop_ids.update(word_ids)
+
+        stop_ids.add(tokenizer.eos_token_id)
+        self.stopping_criteria = StoppingCriteriaList([StopOnTokens(list(stop_ids))])
             
     # Generation processing
     NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -79,6 +86,7 @@ class ThroughputCallback(TrainerCallback):
         model.eval()
         correct, total = 0, 0
         eval_batch_size = 100
+        all_prompts, all_preds, all_golds = [], [], []
         for i in range(0, len(self.prompts), eval_batch_size):
             batch_prompts = self.prompts[i:i + eval_batch_size]
             batch_answers = self.answers[i:i + eval_batch_size]
@@ -111,11 +119,21 @@ class ThroughputCallback(TrainerCallback):
                 if self.normalize_compare(pred_ans, gold_ans):
                     correct += 1
                 total += 1
+                all_prompts.append(pred_text)
+                all_golds.append(gold_ans)
+                all_preds.append(pred_ans)
         acc = correct / total if total > 0 else 0.0
         wandb.log(
             {"eval/accuracy": acc},
             step=state.global_step,
             commit=False
+        )
+        eval_table = wandb.Table(columns=["Prompt", "Prediction", "Gold Answer"])
+        for p, pred, gold in zip(all_prompts, all_preds, all_golds):
+            eval_table.add_data(p, pred, gold)
+        wandb.log(
+            {"eval/generations": eval_table},
+            step=state.global_step
         )
         model.train()
         return control
@@ -214,7 +232,7 @@ def build_sft_data(split, name: str):
                 raise ValueError(f"Exists sample with None values: {name}, {i}-th")
             data.append({"prompt" : prompt, "reasoning" : rationale, "answer": correct})
     N = len(data)
-    return data[:min(N, 3205)] # (prompt, gold reasoning, gold answer)
+    return data[:min(N, 3205)] # (prompt, gold reasoning, gold answer) #3205
 def load_sft_dataset(name : str):
     if name == "gsm8k":
         gsm8k = load_dataset("openai/gsm8k", "main")
@@ -333,15 +351,19 @@ def build_trainer(tokenizer, model, train, eval, warmup_ratio, epochs, batch_siz
         per_device_train_batch_size = batch_size,
         per_device_eval_batch_size = batch_size,
         gradient_accumulation_steps = grad_accum,
+        learning_rate=lr,
         lr_scheduler_type = "constant_with_warmup",
-        warmup_ratio = warmup_ratio,
+        warmup_steps = warmup_steps,
+        #warmup_ratio = warmup_ratio,
         logging_steps = log_every,
         logging_strategy = "steps",
         seed = seed,
+        save_steps = log_every,
+        eval_steps = log_every,
         eval_strategy = "steps",
         save_strategy = "steps",
         eval_accumulation_steps = 2,
-        save_total_limit = 2,
+        save_total_limit = 4,
         bf16=True,
         report_to = ["wandb"],
         load_best_model_at_end = True
@@ -349,12 +371,12 @@ def build_trainer(tokenizer, model, train, eval, warmup_ratio, epochs, batch_siz
 
     data_collator = ChatLMDataCollator(tokenizer = tokenizer, pad_to_multiply_of=8)
 
-    optimizer = build_optimizer(model, optimizer_name, lr, adamw_weight_decay, adamw_eps,
-        muon_weight_decay, muon_momentum=muon_momentum, muon_eps=muon_eps, muon_nesterov=muon_nesterov, muon_ns_coeff= muon_ns_coeff, muon_ns_steps=muon_ns_steps)
+    # optimizer = build_optimizer(model, optimizer_name, lr, adamw_weight_decay, adamw_eps,
+    #     muon_weight_decay, muon_momentum=muon_momentum, muon_eps=muon_eps, muon_nesterov=muon_nesterov, muon_ns_coeff= muon_ns_coeff, muon_ns_steps=muon_ns_steps)
 
     #scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps = warmup_steps, num_training_steps = total_steps)
 
-    trainer = Trainer(model = model, args = args, train_dataset = train, eval_dataset = eval, data_collator = data_collator, optimizers = (optimizer, None))
+    trainer = Trainer(model = model, args = args, train_dataset = train, eval_dataset = eval, data_collator = data_collator)
     gen_callback = ThroughputCallback(tokenizer = tokenizer, eval_dataset=eval, temperature = temperature, max_new_tokens=max_new_tokens, top_p= top_p)
     trainer.add_callback(gen_callback)
     return trainer
@@ -426,14 +448,14 @@ def main():
     model_name = "meta-llama/Llama-3.1-8B"
     optimizer_name = "adamw" #muon
     save_dir = "./runs"
-    index = "3-160-4-4-10" # config_index, number of samples, batch size, grad acc, log every
+    index = "main-3205-4-4-10-5e-6-01" # config_index, number of samples, batch size, grad acc, log every, lr
     # config_index 1) lr = 0.001 (linear decay), wd=0.01, # train samples: 1600, #eval samples: 50
     # config_index 2) lr = 0.002 (linear decay), wd=0.01, # train samples: 1960, #eval samples: 50 
     # config_index 3) lr = 0.0002 (static with), wd=0.01, # train samples: 160, #eval samples: 50
-    lr, weight_decay = [0.0001, 0.001], [0.01, 0.1] # adamw , muon
+    lr, weight_decay = [0.000005, 0.001], [0.1, 0.1] # adamw , muon
     eps = [1e-8, 1e-7]
     muon_momentum = 0.1
-    warmup_ratio, epochs, batch_size, grad_accum = 0.1, 1, 2, 8
+    warmup_ratio, epochs, batch_size, grad_accum = 0.1, 1, 4, 4
     log_every, seed = 10, 42
     gmu = 0.7
     max_new_tokens = 512
@@ -449,7 +471,7 @@ def main():
     #load wandb
     wandb.init(
         entity="vqtri-purdue-university",
-        project="Main-llm-sft-evaluation",
+        project="Nov11-Main-llm-sft-evaluation",
         name=f"{optimizer_name}_stage{stage}_{train_or_inference}_{index}",
         config={
             "model_name": model_name,
@@ -579,3 +601,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
