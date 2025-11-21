@@ -4,9 +4,18 @@ mock/
 performace_keeper/
 run_logs/
 tensorboard/
+Moonlight/
+_pycache_/
+
 
 # Ignore notebooks and temporary files
 training_with_tinker.py
+training_with_muon.py
+training_pipeline_beta.py
+
+rms_track.py
 *.ipynb
 requirements.txt
+
+utils.py
 

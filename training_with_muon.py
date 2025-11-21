@@ -354,17 +354,39 @@ class MultiOptim(Optimizer):
         # Prevent accidental dynamic additions later
         raise NotImplementedError("MultiOptim does not support dynamic param groups.")
 
-def build_muon(model, lr, muon_weight_decay=0.0, muon_momentum=0.9,
-               adamw_weight_decay=0.01, adamw_eps=1e-8):
-    muon_params, other_params = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim == 2:
-            muon_params.append(p)   # 2D matrices -> Muon
-        else:
-            other_params.append(p)  # 1D biases, norms -> AdamW
+def build_muon(model, lr, muon_weight_decay=0.0,
+               adamw_weight_decay=0.01):
+    def split_params_for_muon_adamw(model, muon_params, adamw_params):
+        seen = set()
 
+        def add(dst, p):
+            pid = id(p)
+            if pid not in seen and p.requires_grad:
+                seen.add(pid)
+                dst.append(p)
+
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            lname = name.lower()
+
+            is_norm = ("norm" in lname) or ("layernorm" in lname) or ("rms" in lname)
+            is_embed = ("embed" in lname)            # catches embed_tokens & tied weights
+            is_head  = ("lm_head" in lname)
+            is_rope  = ("rotary" in lname) or ("rope" in lname) or ("pos" in lname)
+            is_bias  = lname.endswith(".bias") # gpt says LLama3.1 doesn't have bias (bias=False)
+
+            if (p.ndim == 2
+                and not (is_embed or is_head or is_norm or is_rope)):
+                # true projection matrices (attn & MLP)
+                add(muon_params, p)
+            else:
+                # embeddings, lm_head, norms, biases, others
+                add(adamw_params, p)
+
+        return muon_params, adamw_params
+    
+    muon_params, adamw_params = split_params_for_muon_adamw(model, [],[])  
     optimizers = []
     if muon_params:
         optimizers.append(
@@ -372,16 +394,16 @@ def build_muon(model, lr, muon_weight_decay=0.0, muon_momentum=0.9,
                 muon_params,
                 lr=lr,
                 weight_decay=muon_weight_decay,
-                momentum=muon_momentum,
+                adjust_lr_fn = "match_rms_adamw",
             )
         )
-    if other_params:
+    if adamw_params:
         optimizers.append(
             torch.optim.AdamW(
-                other_params,
+                adamw_params,
                 lr=lr,
                 weight_decay=adamw_weight_decay,
-                eps=adamw_eps,
+                eps= 1e-8,
             )
         )
 
@@ -407,7 +429,7 @@ def build_optimizer(
         )
     elif optimizer_name == "muon":
         return build_muon(
-            model,lr,muon_weight_decay=muon_weight_decay,muon_momentum=muon_momentum,adamw_weight_decay=adamw_weight_decay,adamw_eps=1e-8,
+            model,lr,muon_weight_decay=muon_weight_decay,adamw_weight_decay=adamw_weight_decay
         )
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
