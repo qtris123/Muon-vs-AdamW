@@ -1,12 +1,9 @@
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers import TrainingArguments, Trainer, BitsAndBytesConfig
+from transformers import TrainingArguments, Trainer
 from transformers import TrainerCallback, TrainerState, TrainerControl
 from transformers import StoppingCriteria, StoppingCriteriaList
-# bnb_config = BitsAndBytesConfig(
-#     load_in_8bit=True,   # or load_in_4bit=True
-# )
-from transformers.optimization import get_cosine_schedule_with_warmup
+from transformers.optimization import get_constant_schedule_with_warmup
 from transformers.trainer_utils import set_seed
 import torch
 import math, re, os, json, gc
@@ -18,10 +15,12 @@ import numpy as np
 
 from typing import Dict, List
 import wandb, random
-import psutil, GPUtil, time
+import time
 
 from transformers import TrainerCallback
 import time, torch, wandb
+
+from muon_optimizer import Muon
 
 class StopOnTokens(StoppingCriteria):
     def __init__(self, stop_ids: list[int], device = "cuda"):
@@ -50,7 +49,7 @@ class ThroughputCallback(TrainerCallback):
             self.prompts.append(prompt_text)
             # decode label part to extract the numeric answer
             target_text = tokenizer.decode([t for t in labels if t != -100], skip_special_tokens=True)
-            gold_ans = self.extract_number(target_text)
+            gold_ans = self.extract_letter(target_text)
             self.answers.append(gold_ans)
         # Prepare stop tokens
         stop_words = ["Question"]
@@ -72,6 +71,20 @@ class ThroughputCallback(TrainerCallback):
                 return m.group(0).strip()
         matches = list(NUM_RE.finditer(gen_output))
         return matches[-1].group(0).strip() if matches else ""
+    LETTER_RE = re.compile(r"\b([A-Ea-e])\b")
+    def extract_letter(self, gen_output: str) -> str:
+        # Case 1: Look after ####
+        if "####" in gen_output:
+            tail = gen_output.split("####")[-1].strip()
+            m = self.LETTER_RE.search(tail)
+            if m:
+                return m.group(1).upper()
+
+        # Case 2: Search entire output for A–E
+        matches = list(self.LETTER_RE.finditer(gen_output))
+        if matches:
+            return matches[-1].group(1).upper()
+        return ""
     def normalize_compare(self, gen, ref, eps = 0.1): # it seems like gsm8k dataset only return whole number answer
         def normalize(text: str): #erase ","
             return re.sub(r',', '', text).strip()
@@ -79,6 +92,12 @@ class ThroughputCallback(TrainerCallback):
             return abs(float(normalize(gen)) - float(normalize(ref))) < eps
         except Exception:
             return False
+    def extract_mcq(self, gen_output: str) -> str:
+        if "####" in gen_output:
+            tail = str(gen_output.split("####")[-1]).strip()
+            m = re.search(r"\b([A-E])\b", tail)
+            return m.group(1) if m else ""
+        return
     
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         """Called once after evaluation is finished."""
@@ -112,11 +131,13 @@ class ThroughputCallback(TrainerCallback):
             # Decode predictions
             decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
             for pred_text, gold_ans in zip(decoded, batch_answers):
-                pred_ans = self.extract_number(pred_text)
+                #pred_ans = self.extract_number(pred_text)
+                pred_ans = self.extract_mcq(pred_text)
                 print("@@@@ Eval generation: ", pred_text[-1000:])
                 print("@@@@ Extracted answer: ", pred_ans)
                 print("@@@@ Gold answer: ", gold_ans)
-                if self.normalize_compare(pred_ans, gold_ans):
+                #if self.normalize_compare(pred_ans, gold_ans):
+                if str(pred_ans) == str(gold_ans):
                     correct += 1
                 total += 1
                 all_prompts.append(pred_text)
@@ -125,15 +146,15 @@ class ThroughputCallback(TrainerCallback):
         acc = correct / total if total > 0 else 0.0
         wandb.log(
             {"eval/accuracy": acc},
-            step=state.global_step,
-            commit=False
+            # step=state.global_step,
+            # commit=False
         )
         eval_table = wandb.Table(columns=["Prompt", "Prediction", "Gold Answer"])
-        for p, pred, gold in zip(all_prompts, all_preds, all_golds):
+        for p, pred, gold in zip(all_prompts[:50], all_preds[:50], all_golds[:50]):
             eval_table.add_data(p, pred, gold)
         wandb.log(
             {"eval/generations": eval_table},
-            step=state.global_step
+            # step=state.global_step
         )
         model.train()
         return control
@@ -232,7 +253,8 @@ def build_sft_data(split, name: str):
                 raise ValueError(f"Exists sample with None values: {name}, {i}-th")
             data.append({"prompt" : prompt, "reasoning" : rationale, "answer": correct})
     N = len(data)
-    return data[:min(N, 3205)] # (prompt, gold reasoning, gold answer) #3205
+    return data[:min(N, 1500)] # (prompt, gold reasoning, gold answer) #3205
+    # return data[1923:3205]
 def load_sft_dataset(name : str):
     if name == "gsm8k":
         gsm8k = load_dataset("openai/gsm8k", "main")
@@ -242,9 +264,10 @@ def load_sft_dataset(name : str):
         sft_eval = random.sample(build_sft_data(gsm8k["test"].select(range(n_test// 2, n_test)), "gsm8k"), 400)
     else: #aqua_rat
         aqua_rat = load_dataset("deepmind/aqua_rat", "raw")
-        sft_train = build_sft_data(aqua_rat["train"], "aqua")
-        sft_test = random.sample(build_sft_data(aqua_rat["test"], "aqua"), 100)
-        sft_eval = random.sample(build_sft_data(aqua_rat["validation"], "aqua"), 100)
+        sft_train = build_sft_data(aqua_rat["train"], "aqua")[1500:]
+        eval_test = build_sft_data(aqua_rat["test"], "aqua") + build_sft_data(aqua_rat["validation"], "aqua")
+        sft_test = random.sample(eval_test, 300)
+        sft_eval = random.sample(eval_test, 300)
     return sft_train, sft_test, sft_eval
 
 def tokenize_sft_data(data, tokenizer, max_length = 4096):
@@ -300,28 +323,36 @@ class ChatLMDataCollator:
         }
         return outputs
 
-# Build optimizer [adamw, muon]
-def build_optimizer(
-    model,
-    optimizer_name: str,
-    lr: float,
-    adamw_weight_decay: float,
-    adamw_eps: float,
-    muon_weight_decay: float,
-    muon_momentum: float,
-    muon_eps: float,
-    muon_nesterov: bool = False,
-    muon_ns_coeff: float = None,     # ← add this
-    muon_ns_steps: int = None        # ← and this
-):
-
+# Build optimizer [adamw, muon]    
+def build_optimizer(model, optimizer_name, lr=1e-3, rms_interval = 1, wd=0.1):
     if optimizer_name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr = lr, betas=(0.9, 0.999), eps=adamw_eps, weight_decay = adamw_weight_decay)
+        return torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95)
+        )
     elif optimizer_name == "muon":
-        return torch.optim.Muon(model.parameters(), lr = lr, weight_decay = muon_weight_decay, momentum = muon_momentum,
-                                ns_coefficients=muon_ns_coeff, nesterov= muon_nesterov, eps=muon_eps, ns_steps=muon_ns_steps)
+        muon_params = [
+            p
+            for name, p in model.named_parameters()
+            if p.ndim >= 2 and "embed" not in name and "lm_head" not in name
+        ]
+        adamw_params = [
+            p
+            for name, p in model.named_parameters()
+            if not (
+                p.ndim >= 2 and "embed" not in name and "lm_head" not in name
+            )
+        ]
+
+        return Muon(
+            lr=lr,
+            wd=wd,
+            muon_params=muon_params,
+            adamw_params=adamw_params,
+            rms_interval=rms_interval,
+        )
     else:
-        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+        assert 0, "optimizer not supported"
+        
 # Load model
 def load_model(model_or_ckpt : str, tokenizer : AutoTokenizer):
     #tokenizer = AutoTokenizer.from_pretrained(model_or_ckpt)
@@ -335,7 +366,7 @@ def load_model(model_or_ckpt : str, tokenizer : AutoTokenizer):
 
     return model
 
-def build_trainer(tokenizer, model, train, eval, warmup_ratio, epochs, batch_size, grad_accum, max_new_tokens, temperature, top_p,
+def build_trainer(tokenizer, model, train, eval, warmup_ratio, epochs, batch_size, grad_accum, max_new_tokens, temperature, top_p, rms_interval,
                   output_dir, log_every, seed,
                   optimizer_name : str, lr :float, adamw_weight_decay :float, adamw_eps : float, #adamw
                   muon_weight_decay: float, muon_eps :float, muon_momentum :float, muon_nesterov = True, muon_ns_coeff = (3.4445, -4.775, 2.0315), muon_ns_steps  = 5): #muon
@@ -352,8 +383,8 @@ def build_trainer(tokenizer, model, train, eval, warmup_ratio, epochs, batch_siz
         per_device_eval_batch_size = batch_size,
         gradient_accumulation_steps = grad_accum,
         learning_rate=lr,
-        lr_scheduler_type = "constant_with_warmup",
-        warmup_steps = warmup_steps,
+        # lr_scheduler_type = "constant_with_warmup",
+        # warmup_steps = warmup_steps,
         #warmup_ratio = warmup_ratio,
         logging_steps = log_every,
         logging_strategy = "steps",
@@ -363,7 +394,7 @@ def build_trainer(tokenizer, model, train, eval, warmup_ratio, epochs, batch_siz
         eval_strategy = "steps",
         save_strategy = "steps",
         eval_accumulation_steps = 2,
-        save_total_limit = 4,
+        save_total_limit = 2,
         bf16=True,
         report_to = ["wandb"],
         load_best_model_at_end = True
@@ -371,12 +402,11 @@ def build_trainer(tokenizer, model, train, eval, warmup_ratio, epochs, batch_siz
 
     data_collator = ChatLMDataCollator(tokenizer = tokenizer, pad_to_multiply_of=8)
 
-    # optimizer = build_optimizer(model, optimizer_name, lr, adamw_weight_decay, adamw_eps,
-    #     muon_weight_decay, muon_momentum=muon_momentum, muon_eps=muon_eps, muon_nesterov=muon_nesterov, muon_ns_coeff= muon_ns_coeff, muon_ns_steps=muon_ns_steps)
+    optimizer = build_optimizer(model, optimizer_name, lr, rms_interval)
 
-    #scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps = warmup_steps, num_training_steps = total_steps)
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps = warmup_steps)
 
-    trainer = Trainer(model = model, args = args, train_dataset = train, eval_dataset = eval, data_collator = data_collator)
+    trainer = Trainer(model = model, args = args, train_dataset = train, eval_dataset = eval, data_collator = data_collator, optimizers = (optimizer, scheduler))
     gen_callback = ThroughputCallback(tokenizer = tokenizer, eval_dataset=eval, temperature = temperature, max_new_tokens=max_new_tokens, top_p= top_p)
     trainer.add_callback(gen_callback)
     return trainer
@@ -390,73 +420,69 @@ def load_vllm_model(model_or_ckpt: str,gmu: float, tokenizer : AutoTokenizer):
     llm.pad_token_id = tokenizer.eos_token_id
     return llm
 
-def evaluate_vllm(global_step, llm, tokenizer, data_name, samples, max_new_tokens=512, temperature=0.2, top_p=1.0):
+def evaluate_vllm(global_step, llm, tokenizer, data_name, samples,
+                  batch_size=200, max_new_tokens=512,
+                  temperature=0.2, top_p=1.0):
+
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_new_tokens,
-        stop = ["Question:"]
+        stop=["Question"],
     )
 
-    # Generation
-    prompts = []
-    for i, p in enumerate(samples):
-        prompt = p["prompt"]
-        if not isinstance(prompt, str) or prompt.strip() == "":
-            raise ValueError(f"Invalid prompt at index {i}: {repr(p)}")
-        prompts.append(prompt)
-    start = time.time()
-    outputs = llm.generate(prompts, sampling_params)
-    end = time.time()
+    correct, total_tokens = 0, 0
+    rows = []
 
-    # Eval
-    rows, correct, total_tokens = [], 0, 0
-    for i, output in enumerate(outputs):
-        text = output.outputs[0].text.strip()
-        print("Generated output is: ", text)
-        gold = samples[i]["answer"].strip()
+    for i in range(0, len(samples), batch_size):
+        batch = samples[i:i+batch_size]
+        prompts = [p["prompt"] for p in batch]
 
-        is_correct = False
-        if data_name == "gsm8k":
-            final = extract_number(text)
-            gold = extract_number(gold)
-            print(f"[{data_name}]Extracted final is {final}, and gold is {gold}")
-            is_correct = final and normalize_compare(final, gold)
-        else:
-            final = extract_mcq(text)
-            print(f"[{data_name}] Extracted final is {final} and gold is {gold}")
-            is_correct = final == gold
+        start = time.time()
+        outputs = llm.generate(prompts, sampling_params)
+        end = time.time()
 
-        correct += int(is_correct)
-        total_tokens += len(tokenizer.encode(text))
-        rows.append([prompts[i], text, final, gold, is_correct])
+        for j, output in enumerate(outputs):
+            text = output.outputs[0].text.strip()
+            gold = batch[j]["answer"].strip()
 
-    # Log
-    acc = correct / len(samples)
-    avg_len = total_tokens / len(samples)
-    throughput = total_tokens / (end - start)
+            if data_name == "gsm8k":
+                final = extract_number(text)
+                gold_num = extract_number(gold)
+                is_correct = final and normalize_compare(final, gold_num)
+            else:
+                final = extract_mcq(text)
+                is_correct = final == gold
 
-    wandb.run.summary = wandb.Table(columsn = ["name", "accuracy", "avg_output_len", "total_tokens", "token_per_sec", "inference_time"])
-    wandb.run.summary["evaluation_table"].add_data(data_name, acc, avg_len, total_tokens, throughput, end - start)
+            correct += int(is_correct)
+            total_tokens += len(tokenizer.encode(text))
 
-    table = wandb.Table(columns = ["Prompt", "Model Ouput", "Pred", "Gold", "Correct"], data = [rows[i] for i in range(0, len(rows), 50)])
-    wandb.log({f"generations/{data_name}/{f'stage_{global_step}'}": table})
+            rows.append([prompts[j], text, final, gold, is_correct])
 
-    return acc
+    accuracy = correct / len(samples)
+    avg_tps = total_tokens / (i+batch_size)
+
+    print("@@@ Accuracy: ", accuracy)
+    print("@@@ Generations: ", rows)
+    return accuracy
+
  
 def main():
     model_name = "meta-llama/Llama-3.1-8B"
-    optimizer_name = "adamw" #muon
+    #model_name = "/content/drive/MyDrive/NTI/MuonVsAdamw2/runs/muon_stage3_8(2)-3205-4-4-20-5e-6-01/checkpoint-100"
+    optimizer_name = "muon" #muon
     save_dir = "./runs"
-    index = "main-3205-4-4-10-5e-6-01" # config_index, number of samples, batch size, grad acc, log every, lr
+    index = "inference-stage0"
+    #index = "8(2)-3205-4-4-20-5e-6-01" # config_index, number of samples, batch size, grad acc, log every, lr
     # config_index 1) lr = 0.001 (linear decay), wd=0.01, # train samples: 1600, #eval samples: 50
     # config_index 2) lr = 0.002 (linear decay), wd=0.01, # train samples: 1960, #eval samples: 50 
     # config_index 3) lr = 0.0002 (static with), wd=0.01, # train samples: 160, #eval samples: 50
-    lr, weight_decay = [0.000005, 0.001], [0.1, 0.1] # adamw , muon
+    lr, weight_decay = [0.00005, 0.001], [0.1, 0.1] # adamw , muon
     eps = [1e-8, 1e-7]
     muon_momentum = 0.1
-    warmup_ratio, epochs, batch_size, grad_accum = 0.1, 1, 4, 4
-    log_every, seed = 10, 42
+    warmup_ratio, epochs, batch_size, grad_accum = 0.0, 1, 4, 4
+    rms_interval = 16
+    log_every, seed = 20, 42
     gmu = 0.7
     max_new_tokens = 512
     temperature = 0.2 
@@ -464,14 +490,14 @@ def main():
     set_seed(seed)
     random.seed(seed)
 
-    stage = 1 # 0/ 1/ 2 / 3 (both)
-    train_or_inference = "train" # train / inference
+    stage = 0 # 0/ 1/ 2 / 3 (both)
+    train_or_inference = "inference" # train / inference
 
     print("Before wandb init")
     #load wandb
     wandb.init(
         entity="vqtri-purdue-university",
-        project="Nov11-Main-llm-sft-evaluation",
+        project="Nov19-Muon-llm-vllm-inference",
         name=f"{optimizer_name}_stage{stage}_{train_or_inference}_{index}",
         config={
             "model_name": model_name,
@@ -487,7 +513,7 @@ def main():
     )
 
     #load tokenizer (setting pad_token inside load_vllm)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B", use_fast=True)
 
     #prepare datasets
     if train_or_inference == "inference" or train_or_inference == "both":
@@ -515,8 +541,8 @@ def main():
       vllm_model = load_vllm_model(model_name, gmu, tokenizer)
       print("Finished loading vllm")
 
-      acc_gsm0 = evaluate_vllm(0, vllm_model, tokenizer, "gsm8k", test_gsm8k, max_new_tokens)
-      acc_aqua0 = evaluate_vllm(0, vllm_model, tokenizer, "aqua", test_aqua, max_new_tokens)
+      acc_gsm0 = evaluate_vllm(0, vllm_model, tokenizer, "gsm8k", test_gsm8k, batch_size, max_new_tokens)
+      acc_aqua0 = evaluate_vllm(0, vllm_model, tokenizer, "aqua", test_aqua, batch_size, max_new_tokens)
       print(f"[{optimizer_name}][Stage 0] GSM8K: {acc_gsm0:.3f} | AQUA: {acc_aqua0:.3f}")
 
     stage1_dir = os.path.join(save_dir, optimizer_name + "_stage2_" + index)
@@ -527,78 +553,44 @@ def main():
       if train_or_inference == "train" or train_or_inference == "both":
         hf_model = load_model(model_name, tokenizer)
         print("After loading & Before training: ", hf_model.hf_device_map)
-        trainer1 = build_trainer(tokenizer,  hf_model, sft_train_gsm8k, sft_eval_gsm8k, warmup_ratio, epochs, batch_size, grad_accum, max_new_tokens, temperature, top_p,
+        trainer1 = build_trainer(tokenizer,  hf_model, sft_train_gsm8k, sft_eval_gsm8k, warmup_ratio, epochs, batch_size, grad_accum, max_new_tokens, temperature, top_p, rms_interval,
                         stage1_dir, log_every, seed,
                         optimizer_name, lr[0], weight_decay[0], eps[0],
                         weight_decay[1], eps[1], muon_momentum)
         trainer1.train()
         print("After training: ", hf_model.hf_device_map)
-        #hf_model.save_pretrained(stage1_dir, safe_serialization=True)
-        #tokenizer.save_pretrained(stage1_dir) #bc trainer1.save_model() doesn't save tokenizer the right way
         print("Model at stage 1 saved")
 
       if train_or_inference == "inference" or train_or_inference == "both":
-        vllm_model_1 = load_vllm_model(stage1_dir, gmu, tokenizer)
-        acc_gsm1 = evaluate_vllm(1, vllm_model_1, tokenizer, "gsm8k", test_gsm8k, max_new_tokens)
-        acc_aqua1 = evaluate_vllm(1, vllm_model_1, tokenizer, "aqua", test_aqua, max_new_tokens)
+        vllm_model_1 = load_vllm_model(model_name, gmu, tokenizer)
+        acc_gsm1 = evaluate_vllm(1, vllm_model_1, tokenizer, "gsm8k", test_gsm8k, batch_size, max_new_tokens)
+        acc_aqua1 = evaluate_vllm(1, vllm_model_1, tokenizer, "aqua", test_aqua, batch_size, max_new_tokens)
         print(f"[{optimizer_name}][Stage 2] GSM8K: {acc_gsm1:.3f} | AQUA: {acc_aqua1:.3f}")
-
-    stage2_dir = os.path.join(save_dir, optimizer_name + "_stage2_" + index)
+    
+    stage2_dir = os.path.join(save_dir, optimizer_name + "_stage3_" + index)
     acc_gsm2 = 0
     acc_aqua2 = 0
     if stage == 2 or stage == 3:
       #stage2
       if train_or_inference == "train" or train_or_inference == "both":
-        hf_model_2 = load_model(stage1_dir, tokenizer)
-        trainer2 = build_trainer(tokenizer,  hf_model_2, sft_train_aqua, sft_eval_aqua, warmup_ratio, epochs, batch_size, grad_accum, max_new_tokens, top_p,
+        hf_model_2 = load_model(model_name, tokenizer)
+        print("After loading & Before training: ", hf_model_2.hf_device_map)
+        trainer2 = build_trainer(tokenizer,  hf_model_2, sft_train_aqua, sft_eval_aqua, warmup_ratio, epochs, batch_size, grad_accum, max_new_tokens, temperature, top_p, rms_interval,
                         stage2_dir, log_every, seed,
                         optimizer_name, lr[0], weight_decay[0], eps[0],
                         weight_decay[1], eps[1], muon_momentum)
         trainer2.train()
-        #hf_model_2.save_pretrained(stage2_dir, safe_serialization=True)
-        #tokenizer.save_pretrained(stage2_dir)
+        print("After training: ", hf_model_2.hf_device_map)
         print("Model at stage 2 saved")
 
       if train_or_inference == "inference" or train_or_inference == "both":
-        vllm_model_2 = load_vllm_model(stage2_dir, gmu, tokenizer)
+        vllm_model_2 = load_vllm_model(model_name, gmu, tokenizer)
         acc_gsm2 = evaluate_vllm(2, vllm_model_2, tokenizer, "gsm8k", test_gsm8k, max_new_tokens)
         acc_aqua2 = evaluate_vllm(2, vllm_model_2, tokenizer, "aqua", test_aqua, max_new_tokens)
         print(f"[{optimizer_name}][Stage 2] GSM8K: {acc_gsm2:.3f} | AQUA: {acc_aqua2:.3f}")
-
-    # forget_gsm  = acc_gsm1  - acc_gsm2
-    # forget_aqua = acc_aqua1 - acc_aqua2
-    # print(f"[{optimizer_name}][Stage 1 improv] GSM8K: {acc_gsm1 - acc_gsm0} | AQUA: {acc_aqua1 - acc_aqua0}")
-    # print(f"[{optimizer_name}][Stage 2 improv] GSM8K: {acc_gsm2 - acc_gsm0} | AQUA: {acc_aqua2 - acc_aqua0}")
-    # print(f"[{optimizer_name}][CF] GSM8K: {forget_gsm} | AQUA: {forget_aqua}")
-
-    # summary = {
-    #     "run_name": index + "_on_test_dataset",
-    #     "optimizer": optimizer_name,
-    #     "model": model_name,
-    #     "epochs": {"stage1_gsm8k": epochs, "stage2_aqua": epochs},
-    #     "acc": {
-    #         "gsm8k": [acc_gsm0, acc_gsm1, acc_gsm2],
-    #         "aqua":  [acc_aqua0, acc_aqua1, acc_aqua2],
-    #     },
-    #     "forgetting": {"gsm8k": forget_gsm, "aqua": forget_aqua},
-    #     "hparams": {
-    #         "lr1": lr, "lr2": lr, "wd1": weight_decay, "wd2": weight_decay,
-    #         "warmup_ratio": warmup_ratio, "bs": batch_size, "grad_accum": grad_accum,
-    #         # "lora": {"r": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout},
-    #         # "muon": {
-    #         #     "momentum": args.muon_momentum, "nesterov": args.muon_nesterov,
-    #         #     "ns_coeff": args.muon_ns_coeff, "eps": args.muon_eps, "ns_steps": args.muon_ns_steps,
-    #         # } if optimizer_name == "muon" else None
-    #     }
-    # }
-    # os.makedirs(save_dir, exist_ok=True)
-    # with open(os.path.join(save_dir, f"{index}_summary.json"), "w", encoding="utf-8") as f:
-    #     json.dump(summary, f, indent=2)
-
-    # return summary
+    
     wandb.finish()
     return None 
 
 if __name__ == "__main__":
     main()
-
