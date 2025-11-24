@@ -2,6 +2,7 @@
 pip install datasets
 pip install transformers
 pip install accelerate
+pip install torch 
 
 # vLLM engine
 pip install vllm
@@ -11,3 +12,5 @@ pip install scikit-learn numpy
 
 # Logging
 pip install wandb
+pip install loguru
+
